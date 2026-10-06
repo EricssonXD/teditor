@@ -1,0 +1,12 @@
+[package]
+name = "teditor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Standalone terminal sidebar inspired by Herdr Sidebar"
+
+[dependencies]
+crossterm = "0.29"
+ratatui = "0.30"
+ignore = "0.4"
