@@ -7,6 +7,7 @@
 //! preview, activity bar, or separate graph view here. Git operations use the
 //! sibling `crate::scm` core, including HEAD-only `graph(30)` (never `--all`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{
@@ -48,6 +49,38 @@ pub enum ScmAction {
     OpenReference {
         root: PathBuf,
         reference: DrawerRef,
+    },
+    CreateBranch(PathBuf),
+    CreateStash(PathBuf),
+    Pull(PathBuf),
+    SwitchBranch {
+        root: PathBuf,
+        name: String,
+    },
+    CheckoutTag {
+        root: PathBuf,
+        name: String,
+    },
+    CheckoutCommit {
+        root: PathBuf,
+        hash: String,
+    },
+    DeleteBranch {
+        root: PathBuf,
+        name: String,
+    },
+    DiscardFile {
+        root: PathBuf,
+        path: String,
+        staged: bool,
+    },
+    ApplyStash {
+        root: PathBuf,
+        index: usize,
+    },
+    DropStash {
+        root: PathBuf,
+        index: usize,
     },
 }
 
@@ -222,6 +255,32 @@ impl ScmView {
 
     pub fn active_root(&self) -> Option<&Path> {
         self.repos.get(self.active).map(|repo| repo.git.root())
+    }
+
+    pub fn show_feedback(&mut self, message: String, error: bool) {
+        self.flash = Some((message, error));
+    }
+
+    pub fn decorations(&self, workspace: &Path) -> HashMap<PathBuf, char> {
+        let mut decorations = HashMap::new();
+        for repo in &self.repos {
+            for entry in repo.status.staged.iter().chain(repo.status.unstaged.iter()) {
+                let absolute = repo.git.root().join(&entry.path);
+                let Ok(relative) = absolute.strip_prefix(workspace) else {
+                    continue;
+                };
+                decorations.insert(relative.to_path_buf(), entry.letter);
+                let mut parent = relative.parent();
+                while let Some(path) = parent {
+                    if path.as_os_str().is_empty() {
+                        break;
+                    }
+                    decorations.entry(path.to_path_buf()).or_insert('•');
+                    parent = path.parent();
+                }
+            }
+        }
+        decorations
     }
 
     /// Rediscover repositories, preserve their inputs/folds, update status and
@@ -476,8 +535,40 @@ impl ScmView {
                 KeyCode::Enter | KeyCode::Char(' ') => return self.activate(),
                 KeyCode::Left => self.fold_selected(false),
                 KeyCode::Right => self.fold_selected(true),
-                KeyCode::Char('a') => self.stage_all(),
+                KeyCode::Char('a') => {
+                    let action = self.history_action(key.code);
+                    if action != ScmAction::None {
+                        return action;
+                    }
+                    self.stage_all();
+                }
                 KeyCode::Char('u') => self.unstage_all(),
+                KeyCode::Char('f') => self.remote_action('f'),
+                KeyCode::Char('p') => self.remote_action('p'),
+                KeyCode::Char('P') => {
+                    if let Some(root) = self.active_root() {
+                        return ScmAction::Pull(root.to_path_buf());
+                    }
+                }
+                KeyCode::Char('b') => {
+                    if let Some(root) = self.active_root() {
+                        return ScmAction::CreateBranch(root.to_path_buf());
+                    }
+                }
+                KeyCode::Char('z') => {
+                    if let Some(root) = self.active_root() {
+                        return ScmAction::CreateStash(root.to_path_buf());
+                    }
+                }
+                KeyCode::Char('s') => return self.history_action(key.code),
+                KeyCode::Char('d') => {
+                    let action = self.discard_selected_file();
+                    if action != ScmAction::None {
+                        return action;
+                    }
+                    return self.history_action(key.code);
+                }
+                KeyCode::Char('x') => return self.history_action(key.code),
                 KeyCode::Char('+' | '-') => return self.activate(),
                 KeyCode::Char('r') => self.refresh(),
                 KeyCode::Char('o') => return self.open_file(),
@@ -648,6 +739,116 @@ impl ScmView {
     fn finish_op(&mut self, result: Result<(), String>) {
         self.flash = result.err().map(|error| (error, true));
         // reload, not refresh: refresh would erase the operation's error.
+        self.reload();
+    }
+
+    fn discard_selected_file(&self) -> ScmAction {
+        let Some(row) = self
+            .selected
+            .and_then(|index| self.rows.get(index))
+            .copied()
+        else {
+            return ScmAction::None;
+        };
+        let (repo_index, file_index, staged) = match row {
+            Row::Staged(repo, file) => (repo, file, true),
+            Row::Unstaged(repo, file) => (repo, file, false),
+            _ => return ScmAction::None,
+        };
+        let repo = &self.repos[repo_index];
+        let entry = if staged {
+            &repo.status.staged[file_index]
+        } else {
+            &repo.status.unstaged[file_index]
+        };
+        ScmAction::DiscardFile {
+            root: repo.git.root().to_path_buf(),
+            path: entry.path.clone(),
+            staged,
+        }
+    }
+
+    fn history_action(&self, key: KeyCode) -> ScmAction {
+        let Some(Row::DrawerLine(kind, index)) = self
+            .selected
+            .and_then(|selected| self.rows.get(selected))
+            .copied()
+        else {
+            return ScmAction::None;
+        };
+        let Some(root) = self.active_root().map(Path::to_path_buf) else {
+            return ScmAction::None;
+        };
+        let Some(reference) = self.drawers[drawer_index(kind)].refs.get(index) else {
+            return ScmAction::None;
+        };
+        match (key, reference) {
+            (
+                KeyCode::Char('s'),
+                DrawerRef::Branch {
+                    name,
+                    current: false,
+                },
+            ) => ScmAction::SwitchBranch {
+                root,
+                name: name.clone(),
+            },
+            (KeyCode::Char('s'), DrawerRef::Tag(name)) => ScmAction::CheckoutTag {
+                root,
+                name: name.clone(),
+            },
+            (KeyCode::Char('s'), DrawerRef::Commit(hash)) => ScmAction::CheckoutCommit {
+                root,
+                hash: hash.clone(),
+            },
+            (KeyCode::Char('a'), DrawerRef::Stash(index)) => ScmAction::ApplyStash {
+                root,
+                index: *index,
+            },
+            (
+                KeyCode::Char('d' | 'x'),
+                DrawerRef::Branch {
+                    name,
+                    current: false,
+                },
+            ) => ScmAction::DeleteBranch {
+                root,
+                name: name.clone(),
+            },
+            (KeyCode::Char('d' | 'x'), DrawerRef::Stash(index)) => ScmAction::DropStash {
+                root,
+                index: *index,
+            },
+            _ => ScmAction::None,
+        }
+    }
+
+    fn remote_action(&mut self, action: char) {
+        let result = self
+            .repos
+            .get(self.active)
+            .map(|repo| match action {
+                'f' => repo.git.fetch(),
+                'p' => repo.git.push(),
+                _ => repo.git.pull(),
+            })
+            .unwrap_or_else(|| Err("No Git repository found".into()));
+        self.flash = Some(match result {
+            Ok(output) => (
+                if output.trim().is_empty() {
+                    match action {
+                        'f' => "Fetched",
+                        'p' => "Pushed",
+                        _ => "Pulled",
+                    }
+                    .into()
+                } else {
+                    one_line(&output)
+                },
+                false,
+            ),
+            Err(error) => (error, true),
+        });
         self.reload();
     }
 
@@ -831,7 +1032,7 @@ impl ScmView {
             Constraint::Length(message_height),
             Constraint::Length(if controls { 3 } else { 0 }),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .areas(area);
         self.zones.header = header;
@@ -844,24 +1045,36 @@ impl ScmView {
             self.draw_button(frame, button, 0, 0);
         }
         self.draw_list(frame, list, theme);
-        let (text, style) = if let Some((message, error)) = &self.flash {
-            (
-                format!(" {}", one_line(message)),
-                Style::default().fg(if *error { ERROR } else { FG }),
-            )
-        } else if self.repos.is_empty() {
-            (
-                " No Git repository found · r refresh".to_string(),
-                Style::default().fg(ERROR),
-            )
-        } else {
-            (
-                " Enter stage/open · a stage all · u unstage all · c commit · r refresh"
-                    .to_string(),
+        let help = [
+            Line::styled(
+                " Enter stage/open · a stage/apply · u unstage · d discard · r refresh",
                 Style::default().fg(MUTED),
-            )
+            ),
+            Line::styled(
+                " f fetch · p push · P pull · b branch · z stash · s switch · x delete/drop",
+                Style::default().fg(MUTED),
+            ),
+        ];
+        let lines = if let Some((message, error)) = &self.flash {
+            vec![
+                Line::styled(
+                    format!(" {}", one_line(message)),
+                    Style::default().fg(if *error { ERROR } else { FG }),
+                ),
+                help[1].clone(),
+            ]
+        } else if self.repos.is_empty() {
+            vec![
+                Line::styled(
+                    " No Git repository found · r refresh",
+                    Style::default().fg(ERROR),
+                ),
+                help[1].clone(),
+            ]
+        } else {
+            help.to_vec()
         };
-        frame.render_widget(Paragraph::new(text).style(style), footer);
+        frame.render_widget(Paragraph::new(lines), footer);
     }
 
     fn draw_header(&mut self, frame: &mut Frame<'_>, area: Rect, theme: IconTheme) {
@@ -1626,6 +1839,76 @@ mod tests {
             .position(|candidate| *candidate == row)
             .unwrap();
         view.select(index);
+    }
+
+    #[test]
+    fn exposes_branch_stash_discard_and_remote_actions() {
+        let fixture = Fixture::repo();
+        commit_file(&fixture.0, "file.txt", "base\n");
+        git(&fixture.0, &["branch", "topic"]);
+        let mut view = ScmView::new(&fixture.0);
+
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('b'))),
+            ScmAction::CreateBranch(fixture.0.clone())
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('z'))),
+            ScmAction::CreateStash(fixture.0.clone())
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('P'))),
+            ScmAction::Pull(fixture.0.clone())
+        );
+
+        view.drawers[drawer_index(Drawer::Branches)].expanded = true;
+        view.load_drawer(Drawer::Branches);
+        view.rebuild();
+        let topic = view.drawers[drawer_index(Drawer::Branches)]
+            .refs
+            .iter()
+            .position(
+                |reference| matches!(reference, DrawerRef::Branch { name, .. } if name == "topic"),
+            )
+            .unwrap();
+        select_row(&mut view, Row::DrawerLine(Drawer::Branches, topic));
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('s'))),
+            ScmAction::SwitchBranch {
+                root: fixture.0.clone(),
+                name: "topic".into(),
+            }
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('x'))),
+            ScmAction::DeleteBranch {
+                root: fixture.0.clone(),
+                name: "topic".into(),
+            }
+        );
+
+        std::fs::write(fixture.0.join("file.txt"), "changed\n").unwrap();
+        view.refresh();
+        select_row(&mut view, Row::Unstaged(0, 0));
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('d'))),
+            ScmAction::DiscardFile {
+                root: fixture.0.clone(),
+                path: "file.txt".into(),
+                staged: false,
+            }
+        );
+    }
+
+    #[test]
+    fn explorer_decorations_include_file_state_and_changed_ancestors() {
+        let fixture = Fixture::repo();
+        std::fs::create_dir_all(fixture.0.join("src")).unwrap();
+        std::fs::write(fixture.0.join("src/new.rs"), "fn main() {}\n").unwrap();
+        let view = ScmView::new(&fixture.0);
+        let decorations = view.decorations(&fixture.0);
+        assert_eq!(decorations.get(Path::new("src/new.rs")), Some(&'U'));
+        assert_eq!(decorations.get(Path::new("src")), Some(&'•'));
     }
 
     #[test]

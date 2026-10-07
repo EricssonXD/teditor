@@ -6,21 +6,22 @@ mod search;
 mod search_view;
 mod tree;
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use editor::{EditAction, Editor, SaveOutcome};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use scm::Git;
 use scm_view::{DrawerRef, ScmAction, ScmView};
 use search_view::{SearchAction, SearchView};
 use tree::{Row, Tree};
@@ -50,10 +51,10 @@ fn main() -> io::Result<()> {
     let mut app = App::new(root, selected);
     let mut terminal = ratatui::init();
     let result = (|| {
-        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+        crossterm::execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
         run(&mut terminal, &mut app)
     })();
-    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -102,6 +103,10 @@ fn handle_event(app: &mut App, event: Event) -> bool {
             app.on_mouse(mouse);
             false
         }
+        Event::Paste(text) => {
+            app.on_paste(&text);
+            false
+        }
         _ => false,
     }
 }
@@ -138,6 +143,10 @@ struct Preview {
     anchor: usize,
     scroll: usize,
     edit_target: Option<EditTarget>,
+    git_target: Option<EditTarget>,
+    hunks: Vec<String>,
+    hunk_ranges: Vec<(usize, usize)>,
+    selected_hunk: usize,
 }
 
 impl Preview {
@@ -154,8 +163,93 @@ impl Preview {
             anchor,
             scroll: 0,
             edit_target: None,
+            git_target: None,
+            hunks: Vec::new(),
+            hunk_ranges: Vec::new(),
+            selected_hunk: 0,
         }
     }
+
+    fn attach_git_diff(&mut self, target: EditTarget) {
+        self.git_target = Some(target);
+        self.hunks = split_diff_hunks(&self.lines);
+        self.hunk_ranges = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.starts_with("@@").then_some(index))
+            .map(|start| {
+                let end = self
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .skip(start + 1)
+                    .find(|(_, line)| line.starts_with("@@"))
+                    .map_or(self.lines.len(), |(end, _)| end);
+                (start, end)
+            })
+            .collect();
+        self.selected_hunk = 0;
+        self.anchor = self.hunk_ranges.first().map_or(0, |(start, _)| *start);
+        self.scroll = self.anchor;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExplorerAction {
+    Open,
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+struct ContextMenu {
+    path: PathBuf,
+    is_dir: bool,
+    actions: Vec<ExplorerAction>,
+    selected: usize,
+    origin: Position,
+    area: Rect,
+    items_area: Rect,
+}
+
+enum InputAction {
+    CreateFile(PathBuf),
+    CreateFolder(PathBuf),
+    Rename(PathBuf),
+    CreateBranch(PathBuf),
+    CreateStash(PathBuf),
+}
+
+enum ConfirmAction {
+    DeletePath(PathBuf),
+    DiscardFile {
+        root: PathBuf,
+        path: String,
+        staged: bool,
+    },
+    DeleteBranch {
+        root: PathBuf,
+        name: String,
+    },
+    DropStash {
+        root: PathBuf,
+        index: usize,
+    },
+}
+
+enum Dialog {
+    Input {
+        title: String,
+        value: Vec<char>,
+        cursor: usize,
+        action: InputAction,
+    },
+    Confirm {
+        message: String,
+        action: ConfirmAction,
+    },
 }
 
 struct App {
@@ -165,6 +259,10 @@ struct App {
     search: SearchView,
     scm: ScmView,
     status: Option<String>,
+    context_menu: Option<ContextMenu>,
+    dialog: Option<Dialog>,
+    drag_source: Option<PathBuf>,
+    drag_target: Option<PathBuf>,
     explorer_selected: usize,
     explorer_scroll: usize,
     body: Rect,
@@ -172,7 +270,11 @@ struct App {
     header_actions: [Rect; 2],
     mouse_pos: Option<(u16, u16)>,
     preview: Option<Preview>,
-    editor: Option<Editor>,
+    editors: Vec<Editor>,
+    active_editor: Option<usize>,
+    sidebar_focused: bool,
+    editor_tab_buttons: Vec<(Rect, usize)>,
+    editor_tab_close_buttons: Vec<Rect>,
     editor_body: Rect,
 }
 
@@ -190,6 +292,10 @@ impl App {
             search: SearchView::new(),
             scm: ScmView::new(&root),
             status: None,
+            context_menu: None,
+            dialog: None,
+            drag_source: None,
+            drag_target: None,
             explorer_selected,
             explorer_scroll: 0,
             body: Rect::default(),
@@ -197,7 +303,11 @@ impl App {
             header_actions: [Rect::default(); 2],
             mouse_pos: None,
             preview: None,
-            editor: None,
+            editors: Vec::new(),
+            active_editor: None,
+            sidebar_focused: false,
+            editor_tab_buttons: Vec::new(),
+            editor_tab_close_buttons: Vec::new(),
             editor_body: Rect::default(),
         }
     }
@@ -218,22 +328,403 @@ impl App {
             self.scm.refresh();
         }
         self.view = view;
+        self.sidebar_focused = self.active_editor.is_some();
         self.status = None;
+    }
+
+    fn open_input(&mut self, title: &str, initial: &str, action: InputAction) {
+        let value = initial.chars().collect::<Vec<_>>();
+        self.dialog = Some(Dialog::Input {
+            title: title.into(),
+            cursor: value.len(),
+            value,
+            action,
+        });
+    }
+
+    fn on_dialog_key(&mut self, key: KeyEvent) -> bool {
+        let Some(dialog) = self.dialog.take() else {
+            return false;
+        };
+        match dialog {
+            Dialog::Input {
+                title,
+                mut value,
+                mut cursor,
+                action,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return false,
+                    KeyCode::Enter => {
+                        self.execute_input(action, &value.iter().collect::<String>());
+                        return false;
+                    }
+                    KeyCode::Left => cursor = cursor.saturating_sub(1),
+                    KeyCode::Right => cursor = (cursor + 1).min(value.len()),
+                    KeyCode::Home => cursor = 0,
+                    KeyCode::End => cursor = value.len(),
+                    KeyCode::Backspace if cursor > 0 => {
+                        cursor -= 1;
+                        value.remove(cursor);
+                    }
+                    KeyCode::Delete if cursor < value.len() => {
+                        value.remove(cursor);
+                    }
+                    KeyCode::Char(ch)
+                        if !ch.is_control()
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT,
+                            ) =>
+                    {
+                        value.insert(cursor, ch);
+                        cursor += 1;
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Input {
+                    title,
+                    value,
+                    cursor,
+                    action,
+                });
+            }
+            Dialog::Confirm { message, action } => match key.code {
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {}
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.execute_confirm(action),
+                _ => self.dialog = Some(Dialog::Confirm { message, action }),
+            },
+        }
+        false
+    }
+
+    fn execute_input(&mut self, action: InputAction, value: &str) {
+        let (result, verb) = match action {
+            InputAction::CreateFile(parent) => (self.create_file(&parent, value), "Created"),
+            InputAction::CreateFolder(parent) => (self.create_folder(&parent, value), "Created"),
+            InputAction::Rename(path) => (self.rename_path(&path, value), "Renamed"),
+            InputAction::CreateBranch(root) => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return;
+                }
+                let result = Git::discover(&root).and_then(|git| {
+                    git.create_branch(value)
+                        .map(|_| format!("Created branch {value}"))
+                });
+                self.finish_worktree_action(&root, None, result, "Branch created");
+                return;
+            }
+            InputAction::CreateStash(root) => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return;
+                }
+                let result = Git::discover(&root).and_then(|git| git.stash_push(value));
+                self.finish_worktree_action(&root, None, result, "Changes stashed");
+                return;
+            }
+        };
+        match result {
+            Ok(Some(path)) => {
+                self.refresh_tree_select(&path);
+                if path.is_file() {
+                    self.open_editor(&path, 0);
+                }
+                self.status = Some(format!("{verb} {}", path.display()));
+            }
+            Ok(None) => self.status = Some(format!("Renamed to {value}")),
+            Err(error) => self.status = Some(error),
+        }
+    }
+
+    fn safe_child(&self, parent: &Path, name: &str) -> Result<PathBuf, String> {
+        let name_path = Path::new(name);
+        if name.trim().is_empty()
+            || name_path.is_absolute()
+            || name_path.components().count() != 1
+            || !matches!(
+                name_path.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+        {
+            return Err("Use a single file or folder name".into());
+        }
+        let root =
+            std::fs::canonicalize(self.tree.root_path()).map_err(|error| error.to_string())?;
+        let parent = std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+        if !parent.starts_with(&root) {
+            return Err("File operation would leave the workspace".into());
+        }
+        Ok(parent.join(name_path))
+    }
+
+    fn create_file(&mut self, parent: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+        let path = self.safe_child(parent, name)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("Cannot create file: {error}"))?;
+        Ok(Some(path))
+    }
+
+    fn create_folder(&mut self, parent: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+        let path = self.safe_child(parent, name)?;
+        std::fs::create_dir(&path).map_err(|error| format!("Cannot create folder: {error}"))?;
+        Ok(Some(path))
+    }
+
+    fn rename_path(&mut self, path: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+        if path == self.tree.root_path() {
+            return Err("Cannot rename the workspace root".into());
+        }
+        let parent = path.parent().ok_or("File has no parent directory")?;
+        let destination = self.safe_child(parent, name)?;
+        if destination.exists() {
+            return Err("A file or folder with that name already exists".into());
+        }
+        std::fs::rename(path, &destination).map_err(|error| format!("Cannot rename: {error}"))?;
+        for editor in &mut self.editors {
+            if editor.path() == path {
+                editor.rename_path(destination.clone());
+            }
+        }
+        Ok(Some(destination))
+    }
+
+    fn move_path_into(&mut self, source: &Path, target: &Path) {
+        if source == self.tree.root_path() || target == source || target.starts_with(source) {
+            self.status = Some("Cannot move a folder into itself".into());
+            self.drag_source = None;
+            return;
+        }
+        let Some(name) = source.file_name() else {
+            self.status = Some("Cannot move the workspace root".into());
+            return;
+        };
+        let destination = match self.safe_child(target, &name.to_string_lossy()) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.status = Some(error);
+                return;
+            }
+        };
+        if destination.exists() {
+            self.status = Some("Destination already exists".into());
+            return;
+        }
+        match std::fs::rename(source, &destination) {
+            Ok(()) => {
+                for editor in &mut self.editors {
+                    let old = editor.path().to_path_buf();
+                    if (old == source || old.starts_with(source))
+                        && let Ok(relative) = old.strip_prefix(source)
+                    {
+                        editor.rename_path(destination.join(relative));
+                    }
+                }
+                self.preview = None;
+                self.refresh_tree_select(&destination);
+                self.status = Some(format!("Moved to {}", destination.display()));
+            }
+            Err(error) => self.status = Some(format!("Cannot move: {error}")),
+        }
+    }
+
+    fn refresh_tree_select(&mut self, path: &Path) {
+        let root = self.tree.root_path();
+        if let Some(parent) = path.parent() {
+            let mut ancestors = parent.ancestors().collect::<Vec<_>>();
+            ancestors.reverse();
+            for ancestor in ancestors
+                .into_iter()
+                .filter(|ancestor| ancestor.starts_with(&root))
+            {
+                if ancestor != root && !self.tree.is_expanded(ancestor) {
+                    self.tree.toggle(ancestor);
+                }
+            }
+        }
+        self.tree.refresh();
+        let rows = self.tree.rows();
+        if let Some(index) = rows.iter().position(|row| row.path == path) {
+            self.explorer_selected = index;
+        }
+    }
+
+    fn execute_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::DeletePath(path) => {
+                if self
+                    .editors
+                    .iter()
+                    .any(|editor| editor.path().starts_with(&path) && editor.dirty())
+                {
+                    self.status = Some(if path.is_dir() {
+                        "Save or discard open files before deleting this folder".into()
+                    } else {
+                        "Save or discard the open file before deleting it".into()
+                    });
+                    return;
+                }
+                let root = self.tree.root_path();
+                let Some(parent) = path.parent() else {
+                    self.status = Some("Cannot delete the workspace root".into());
+                    return;
+                };
+                let confined = std::fs::canonicalize(parent)
+                    .ok()
+                    .zip(std::fs::canonicalize(&root).ok())
+                    .is_some_and(|(parent, root)| parent.starts_with(root));
+                if !confined || path == root {
+                    self.status = Some("Delete target is outside the workspace".into());
+                    return;
+                }
+                let result = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                match result {
+                    Ok(()) => {
+                        let mut index = 0;
+                        while index < self.editors.len() {
+                            if self.editors[index].path().starts_with(&path) {
+                                self.close_editor_at(index);
+                            } else {
+                                index += 1;
+                            }
+                        }
+                        self.tree.refresh();
+                        self.explorer_selected = self
+                            .explorer_selected
+                            .min(self.tree.rows().len().saturating_sub(1));
+                        let message = format!("Deleted {}", path.display());
+                        self.status = Some(message.clone());
+                        self.scm.refresh();
+                        self.scm.show_feedback(message, false);
+                    }
+                    Err(error) => self.status = Some(format!("Cannot delete: {error}")),
+                }
+            }
+            ConfirmAction::DiscardFile { root, path, staged } => {
+                if self.dirty_editor_blocks_git(&root, Some(Path::new(&path))) {
+                    return;
+                }
+                let result = Git::discover(&root).and_then(|git| {
+                    git.discard_path(&path, staged)
+                        .map(|_| format!("Discarded {path}"))
+                });
+                self.finish_worktree_action(
+                    &root,
+                    Some(Path::new(&path)),
+                    result,
+                    "Changes discarded",
+                );
+            }
+            ConfirmAction::DeleteBranch { root, name } => {
+                let result = Git::discover(&root).and_then(|git| {
+                    git.delete_branch(&name)
+                        .map(|_| format!("Deleted branch {name}"))
+                });
+                self.finish_git_action(result, "Branch deleted");
+            }
+            ConfirmAction::DropStash { root, index } => {
+                let result = Git::discover(&root).and_then(|git| git.stash_drop(index));
+                self.finish_git_action(result, "Stash dropped");
+            }
+        }
+    }
+
+    fn on_context_menu_key(&mut self, key: KeyEvent) {
+        let Some(mut menu) = self.context_menu.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.selected = menu.selected.saturating_sub(1);
+                self.context_menu = Some(menu);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                menu.selected = (menu.selected + 1).min(menu.actions.len().saturating_sub(1));
+                self.context_menu = Some(menu);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.activate_context_action(menu.path, menu.is_dir, menu.actions[menu.selected]);
+            }
+            _ => self.context_menu = Some(menu),
+        }
+    }
+
+    fn activate_context_action(&mut self, path: PathBuf, is_dir: bool, action: ExplorerAction) {
+        let parent = if is_dir {
+            path.clone()
+        } else {
+            path.parent().unwrap_or(&path).to_path_buf()
+        };
+        match action {
+            ExplorerAction::Open if is_dir => {
+                self.tree.toggle(&path);
+                self.tree.refresh();
+            }
+            ExplorerAction::Open => self.open_editor(&path, 0),
+            ExplorerAction::NewFile => {
+                self.open_input("New File", "", InputAction::CreateFile(parent))
+            }
+            ExplorerAction::NewFolder => {
+                self.open_input("New Folder", "", InputAction::CreateFolder(parent))
+            }
+            ExplorerAction::Rename => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                self.open_input("Rename", &name, InputAction::Rename(path));
+            }
+            ExplorerAction::Delete => {
+                self.dialog = Some(Dialog::Confirm {
+                    message: format!("Delete {}? [y/N]", path.display()),
+                    action: ConfirmAction::DeletePath(path),
+                });
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
             return false;
         }
-        if self.editor.is_some() {
+        if self.dialog.is_some() {
+            return self.on_dialog_key(key);
+        }
+        if self.context_menu.is_some() {
+            self.on_context_menu_key(key);
+            return false;
+        }
+        let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT))
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        if self.active_editor.is_some() {
+            if key.code == KeyCode::F(6) {
+                self.sidebar_focused = !self.sidebar_focused;
+                return false;
+            }
+            if shortcut && matches!(key.code, KeyCode::Char('f' | 'F')) {
+                self.switch_view(View::Search, true);
+                return false;
+            }
+            if shortcut && matches!(key.code, KeyCode::Char('1' | '2' | '3')) {
+                self.switch_view(view_for_key(key.code), false);
+                return false;
+            }
+            if self.sidebar_focused {
+                return self.on_sidebar_key(key);
+            }
             return self.on_editor_key(key);
         }
         if self.preview.is_some() {
             return self.on_preview_key(key);
         }
-        let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT))
-            || key.modifiers.contains(KeyModifiers::SUPER);
 
         if shortcut && matches!(key.code, KeyCode::Char('f' | 'F')) {
             self.switch_view(View::Search, true);
@@ -260,6 +751,20 @@ impl App {
                     self.switch_view(view_for_key(key.code), false);
                     return false;
                 }
+                let action = self.search.on_key(key);
+                self.on_search_action(action)
+            }
+            View::SourceControl => {
+                let action = self.scm.on_key(key);
+                self.on_scm_action(action)
+            }
+        }
+    }
+
+    fn on_sidebar_key(&mut self, key: KeyEvent) -> bool {
+        match self.view {
+            View::Explorer => self.on_explorer_key(key),
+            View::Search => {
                 let action = self.search.on_key(key);
                 self.on_search_action(action)
             }
@@ -311,7 +816,167 @@ impl App {
                 self.open_reference_preview(&root, reference);
                 false
             }
+            ScmAction::CreateBranch(root) => {
+                self.open_input("Create Branch", "", InputAction::CreateBranch(root));
+                false
+            }
+            ScmAction::CreateStash(root) => {
+                self.open_input("Stash Changes", "WIP", InputAction::CreateStash(root));
+                false
+            }
+            ScmAction::SwitchBranch { root, name } => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return false;
+                }
+                let result = Git::discover(&root).and_then(|git| {
+                    git.switch_branch(&name)
+                        .map(|_| format!("Switched to {name}"))
+                });
+                self.finish_worktree_action(&root, None, result, "Branch switched");
+                false
+            }
+            ScmAction::CheckoutTag { root, name } => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return false;
+                }
+                let result = Git::discover(&root).and_then(|git| {
+                    git.checkout_tag(&name)
+                        .map(|_| format!("Checked out tag {name}"))
+                });
+                self.finish_worktree_action(&root, None, result, "Tag checked out");
+                false
+            }
+            ScmAction::CheckoutCommit { root, hash } => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return false;
+                }
+                let result = Git::discover(&root).and_then(|git| {
+                    git.checkout_commit(&hash)
+                        .map(|_| format!("Checked out {hash}"))
+                });
+                self.finish_worktree_action(&root, None, result, "Commit checked out");
+                false
+            }
+            ScmAction::Pull(root) => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return false;
+                }
+                let result = Git::discover(&root).and_then(|git| git.pull());
+                self.finish_worktree_action(&root, None, result, "Pulled changes");
+                false
+            }
+            ScmAction::DeleteBranch { root, name } => {
+                self.dialog = Some(Dialog::Confirm {
+                    message: format!("Delete branch {name}? [y/N]"),
+                    action: ConfirmAction::DeleteBranch { root, name },
+                });
+                false
+            }
+            ScmAction::DiscardFile { root, path, staged } => {
+                self.dialog = Some(Dialog::Confirm {
+                    message: if staged {
+                        format!("Discard all staged and working changes to {path}? [y/N]")
+                    } else {
+                        format!("Discard working changes to {path}? [y/N]")
+                    },
+                    action: ConfirmAction::DiscardFile { root, path, staged },
+                });
+                false
+            }
+            ScmAction::ApplyStash { root, index } => {
+                if self.dirty_editor_blocks_git(&root, None) {
+                    return false;
+                }
+                let result = Git::discover(&root).and_then(|git| git.stash_apply(index));
+                self.finish_worktree_action(&root, None, result, "Stash applied");
+                false
+            }
+            ScmAction::DropStash { root, index } => {
+                self.dialog = Some(Dialog::Confirm {
+                    message: format!("Drop stash@{{{index}}}? [y/N]"),
+                    action: ConfirmAction::DropStash { root, index },
+                });
+                false
+            }
         }
+    }
+
+    fn finish_git_action(&mut self, result: Result<String, String>, fallback: &str) {
+        self.scm.refresh();
+        let (message, error) = match result {
+            Ok(output) if !output.trim().is_empty() => (output.trim().to_string(), false),
+            Ok(_) => (fallback.to_string(), false),
+            Err(error) => (error, true),
+        };
+        self.scm.show_feedback(message.clone(), error);
+        self.status = Some(message);
+    }
+
+    fn dirty_editor_blocks_git(&mut self, root: &Path, affected: Option<&Path>) -> bool {
+        let affected = affected.map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            }
+        });
+        let blocked = self.editors.iter().any(|editor| {
+            editor.dirty()
+                && editor.path().starts_with(root)
+                && affected
+                    .as_ref()
+                    .is_none_or(|path| editor.path() == path || editor.path().starts_with(path))
+        });
+        if blocked {
+            let message = if affected.is_some() {
+                "Save or discard the open editor before changing this path"
+            } else {
+                "Save or discard open editor tabs before changing the repository worktree"
+            };
+            self.status = Some(message.into());
+            self.scm.show_feedback(message.into(), true);
+        }
+        blocked
+    }
+
+    fn finish_worktree_action(
+        &mut self,
+        root: &Path,
+        affected: Option<&Path>,
+        result: Result<String, String>,
+        fallback: &str,
+    ) {
+        let affected = affected.map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            }
+        });
+        let mut index = 0;
+        while index < self.editors.len() {
+            let path = self.editors[index].path().to_path_buf();
+            let touches = path.starts_with(root)
+                && affected
+                    .as_ref()
+                    .is_none_or(|target| path == *target || path.starts_with(target));
+            if touches
+                && !self.editors[index].dirty()
+                && (!path.is_file()
+                    || self.editors[index]
+                        .reload_if_changed(MAX_PREVIEW_BYTES)
+                        .is_err())
+            {
+                self.close_editor_at(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.tree.refresh();
+        self.explorer_selected = self
+            .explorer_selected
+            .min(self.tree.rows().len().saturating_sub(1));
+        self.finish_git_action(result, fallback);
     }
 
     fn open_file_preview(
@@ -334,15 +999,18 @@ impl App {
         if let Some(staged) = staged {
             match git_diff(root, relative, staged) {
                 Ok(diff) if !diff.trim().is_empty() => {
-                    let preview = Preview::new(
-                        format!(
-                            "{} · {name}",
-                            if staged { "Staged Changes" } else { "Changes" }
-                        ),
-                        diff,
-                        false,
-                        0,
+                    let title = format!(
+                        "{} · {name}",
+                        if staged { "Staged Changes" } else { "Changes" }
                     );
+                    let target = EditTarget {
+                        path: path.clone(),
+                        root: root.to_path_buf(),
+                        relative: relative.to_path_buf(),
+                        staged,
+                    };
+                    let mut preview = Preview::new(title, diff, false, 0);
+                    preview.attach_git_diff(target);
                     self.preview = Some(preview);
                     return;
                 }
@@ -354,12 +1022,6 @@ impl App {
                 _ => {}
             }
         }
-        let edit_target = staged.map(|staged| EditTarget {
-            path: path.clone(),
-            root: root.to_path_buf(),
-            relative: relative.to_path_buf(),
-            staged,
-        });
         let (text, error) = read_preview_file(&path);
         let mut preview = Preview::new(
             format!(
@@ -371,7 +1033,14 @@ impl App {
             true,
             anchor,
         );
-        preview.edit_target = edit_target;
+        let target = EditTarget {
+            path: path.clone(),
+            root: root.to_path_buf(),
+            relative: relative.to_path_buf(),
+            staged: staged.unwrap_or(false),
+        };
+        preview.edit_target = staged.is_none().then(|| target.clone());
+        preview.git_target = staged.map(|_| target);
         self.preview = Some(preview);
     }
 
@@ -398,10 +1067,19 @@ impl App {
     }
 
     fn open_editor(&mut self, path: &Path, line: usize) {
+        if let Some(index) = self.editors.iter().position(|editor| editor.path() == path) {
+            self.active_editor = Some(index);
+            self.sidebar_focused = false;
+            self.editors[index].place_cursor(line, 0);
+            self.status = None;
+            return;
+        }
         match Editor::open(path, MAX_PREVIEW_BYTES) {
             Ok(mut editor) => {
                 editor.place_cursor(line, 0);
-                self.editor = Some(editor);
+                self.editors.push(editor);
+                self.active_editor = Some(self.editors.len() - 1);
+                self.sidebar_focused = false;
                 self.status = None;
             }
             Err(error) => {
@@ -410,33 +1088,104 @@ impl App {
         }
     }
 
+    fn active_editor(&self) -> Option<&Editor> {
+        self.active_editor.and_then(|index| self.editors.get(index))
+    }
+
+    fn active_editor_mut(&mut self) -> Option<&mut Editor> {
+        self.active_editor
+            .and_then(|index| self.editors.get_mut(index))
+    }
+
+    fn close_active_editor(&mut self) {
+        if let Some(index) = self.active_editor {
+            self.close_editor_at(index);
+        }
+    }
+
+    fn close_editor_at(&mut self, index: usize) {
+        if index >= self.editors.len() {
+            return;
+        }
+        self.editors.remove(index);
+        self.active_editor = if self.editors.is_empty() {
+            None
+        } else {
+            let active = self.active_editor.unwrap_or(0);
+            Some(if active > index {
+                active - 1
+            } else {
+                active.min(self.editors.len() - 1)
+            })
+        };
+    }
+
+    fn on_paste(&mut self, text: &str) {
+        if let Some(editor) = self.active_editor_mut() {
+            editor.paste(text);
+            self.status = None;
+        }
+    }
+
     fn on_editor_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER);
+        let shortcut = ctrl && !key.modifiers.contains(KeyModifiers::ALT);
+        if shortcut && matches!(key.code, KeyCode::Char('c' | 'C' | 'x' | 'X')) {
+            let cutting = matches!(key.code, KeyCode::Char('x' | 'X'));
+            let text = self.active_editor().and_then(Editor::selected_text);
+            match text {
+                Some(text) => match copy_to_clipboard(&text) {
+                    Ok(()) => {
+                        if cutting {
+                            self.active_editor_mut().and_then(Editor::cut_selection);
+                        }
+                        self.status = None;
+                    }
+                    Err(error) => self.status = Some(format!("Clipboard copy failed: {error}")),
+                },
+                None => self.status = Some("Select text first".into()),
+            }
+            return false;
+        }
+        if shortcut && matches!(key.code, KeyCode::Char('w' | 'W')) {
+            if self.active_editor().is_some_and(Editor::dirty) {
+                self.status = Some("Unsaved changes · Ctrl+S save / Ctrl+Q discard".into());
+            } else {
+                self.close_active_editor();
+                self.status = None;
+            }
+            return false;
+        }
         let page = usize::from(self.editor_body.height).max(1);
         let action = self
-            .editor
-            .as_mut()
+            .active_editor_mut()
             .map_or(EditAction::None, |editor| editor.handle_key(key, page));
         match action {
             EditAction::None => {
-                if self.editor.as_ref().is_some_and(Editor::dirty) {
+                if self.active_editor().is_some_and(Editor::dirty) {
                     self.status = None;
                 }
             }
             EditAction::Close => {
-                if self.editor.as_ref().is_some_and(Editor::dirty) {
+                if self.active_editor().is_some_and(Editor::dirty) {
                     self.status = Some("Unsaved changes · Ctrl+S save / Ctrl+Q discard".into());
                 } else {
-                    self.editor = None;
+                    self.close_active_editor();
                     self.status = None;
                 }
             }
             EditAction::Discard => {
-                self.editor = None;
+                self.close_active_editor();
                 self.status = None;
             }
             EditAction::Save => {
-                let force = self.editor.as_ref().is_some_and(Editor::external_changed);
-                match self.editor.as_mut().expect("editor exists").save(force) {
+                let force = self.active_editor().is_some_and(Editor::external_changed);
+                match self
+                    .active_editor_mut()
+                    .expect("active editor exists")
+                    .save(force)
+                {
                     Ok(SaveOutcome::Saved) => {
                         self.refresh_edit_preview();
                         self.status = Some("Saved".into());
@@ -449,13 +1198,12 @@ impl App {
                 }
             }
             EditAction::Reload => {
-                if self.editor.as_ref().is_some_and(Editor::dirty) {
+                if self.active_editor().is_some_and(Editor::dirty) {
                     self.status = Some("Unsaved changes · save or Ctrl+Q before reload".into());
                 } else {
                     match self
-                        .editor
-                        .as_mut()
-                        .expect("editor exists")
+                        .active_editor_mut()
+                        .expect("active editor exists")
                         .reload(MAX_PREVIEW_BYTES)
                     {
                         Ok(()) => self.status = Some("Reloaded".into()),
@@ -474,8 +1222,7 @@ impl App {
             .and_then(|preview| preview.edit_target.clone());
         if let Some(target) = target
             && self
-                .editor
-                .as_ref()
+                .active_editor()
                 .is_some_and(|editor| editor.path() == target.path)
         {
             self.open_file_preview(&target.root, &target.relative, Some(target.staged), 0);
@@ -483,6 +1230,63 @@ impl App {
     }
 
     fn on_preview_key(&mut self, key: KeyEvent) -> bool {
+        if let Some(target) = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.git_target.clone())
+        {
+            let has_hunks = self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| !preview.hunks.is_empty());
+            match key.code {
+                KeyCode::Char('[' | ']') => {
+                    if let Some(preview) = &mut self.preview
+                        && !preview.hunk_ranges.is_empty()
+                    {
+                        if key.code == KeyCode::Char('[') {
+                            preview.selected_hunk = preview.selected_hunk.saturating_sub(1);
+                        } else {
+                            preview.selected_hunk =
+                                (preview.selected_hunk + 1).min(preview.hunk_ranges.len() - 1);
+                        }
+                        preview.anchor = preview.hunk_ranges[preview.selected_hunk].0;
+                        preview.scroll = preview.anchor;
+                    }
+                    return false;
+                }
+                KeyCode::Char('s') if !target.staged && has_hunks => {
+                    self.apply_preview_hunk();
+                    return false;
+                }
+                KeyCode::Char('u') if target.staged && has_hunks => {
+                    self.apply_preview_hunk();
+                    return false;
+                }
+                KeyCode::Char('d') => {
+                    self.dialog = Some(Dialog::Confirm {
+                        message: if target.staged {
+                            format!(
+                                "Discard all staged and working changes to {}? [y/N]",
+                                target.relative.display()
+                            )
+                        } else {
+                            format!(
+                                "Discard working changes to {}? [y/N]",
+                                target.relative.display()
+                            )
+                        },
+                        action: ConfirmAction::DiscardFile {
+                            root: target.root,
+                            path: target.relative.to_string_lossy().into_owned(),
+                            staged: target.staged,
+                        },
+                    });
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if key.code == KeyCode::Char('e')
             && let Some(path) = self
                 .preview
@@ -546,6 +1350,38 @@ impl App {
         false
     }
 
+    fn apply_preview_hunk(&mut self) {
+        let Some((target, patch)) = self.preview.as_ref().and_then(|preview| {
+            Some((
+                preview.git_target.clone()?,
+                preview.hunks.get(preview.selected_hunk)?.clone(),
+            ))
+        }) else {
+            return;
+        };
+        let result = Git::discover(&target.root).and_then(|git| {
+            git.apply_hunk(&patch, target.staged).map(|_| {
+                if target.staged {
+                    "Hunk unstaged"
+                } else {
+                    "Hunk staged"
+                }
+                .to_string()
+            })
+        });
+        match result {
+            Ok(message) => {
+                self.scm.refresh();
+                self.scm.show_feedback(message, false);
+                self.open_file_preview(&target.root, &target.relative, Some(target.staged), 0);
+            }
+            Err(error) => {
+                self.scm.show_feedback(error.clone(), true);
+                self.status = Some(error);
+            }
+        }
+    }
+
     fn on_explorer_key(&mut self, key: KeyEvent) -> bool {
         let rows = self.tree.rows();
         match key.code {
@@ -586,6 +1422,63 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(row) = rows.get(self.explorer_selected) {
+                    let parent = if row.is_dir {
+                        row.path.clone()
+                    } else {
+                        row.path.parent().unwrap_or(Path::new(".")).to_path_buf()
+                    };
+                    let action = if key.code == KeyCode::Char('N') {
+                        InputAction::CreateFolder(parent)
+                    } else {
+                        InputAction::CreateFile(parent)
+                    };
+                    self.open_input(
+                        if key.code == KeyCode::Char('N') {
+                            "New Folder"
+                        } else {
+                            "New File"
+                        },
+                        "",
+                        action,
+                    );
+                }
+            }
+            KeyCode::F(2) => {
+                if let Some(row) = rows.get(self.explorer_selected)
+                    && row.path != self.tree.root_path()
+                {
+                    let name = row
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default();
+                    self.open_input("Rename", name, InputAction::Rename(row.path.clone()));
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(row) = rows.get(self.explorer_selected)
+                    && row.path != self.tree.root_path()
+                {
+                    self.dialog = Some(Dialog::Confirm {
+                        message: format!("Delete {}? [y/N]", row.path.display()),
+                        action: ConfirmAction::DeletePath(row.path.clone()),
+                    });
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some(row) = rows.get(self.explorer_selected) {
+                    let y = self.body.y.saturating_add(
+                        self.explorer_selected.saturating_sub(self.explorer_scroll) as u16,
+                    );
+                    self.open_context_menu(
+                        row.path.clone(),
+                        row.is_dir,
+                        Position::new(self.body.x.saturating_add(4), y),
+                    );
+                }
+            }
             KeyCode::Char('.') => {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.tree.refresh();
@@ -609,6 +1502,26 @@ impl App {
         false
     }
 
+    fn open_context_menu(&mut self, path: PathBuf, is_dir: bool, origin: Position) {
+        let mut actions = vec![
+            ExplorerAction::Open,
+            ExplorerAction::NewFile,
+            ExplorerAction::NewFolder,
+        ];
+        if path != self.tree.root_path() {
+            actions.extend([ExplorerAction::Rename, ExplorerAction::Delete]);
+        }
+        self.context_menu = Some(ContextMenu {
+            path,
+            is_dir,
+            actions,
+            selected: 0,
+            origin,
+            area: Rect::default(),
+            items_area: Rect::default(),
+        });
+    }
+
     fn toggle_selected(&mut self, rows: &[Row]) {
         if let Some(row) = rows.get(self.explorer_selected) {
             if row.is_dir {
@@ -622,9 +1535,72 @@ impl App {
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         self.mouse_pos = Some((mouse.column, mouse.row));
-        if let Some(editor) = &mut self.editor {
-            editor.on_mouse(mouse, self.editor_body);
-            self.status = None;
+        let position = Position::new(mouse.column, mouse.row);
+        if self.dialog.is_some() {
+            return;
+        }
+        if self.context_menu.is_some() {
+            let Some(menu) = self.context_menu.take() else {
+                return;
+            };
+            if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.context_menu = Some(menu);
+                return;
+            }
+            if menu.items_area.contains(position) {
+                let index = usize::from(mouse.row.saturating_sub(menu.items_area.y));
+                if let Some(action) = menu.actions.get(index).copied() {
+                    self.activate_context_action(menu.path, menu.is_dir, action);
+                }
+            }
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            for (index, button) in self.activity_buttons.iter().enumerate() {
+                if button.contains(position) {
+                    self.switch_view(
+                        [View::Explorer, View::Search, View::SourceControl][index],
+                        false,
+                    );
+                    return;
+                }
+            }
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((_, index)) = self
+                .editor_tab_buttons
+                .iter()
+                .find(|(area, _)| area.contains(position))
+        {
+            let index = *index;
+            if self
+                .editor_tab_close_buttons
+                .get(index)
+                .is_some_and(|area| area.contains(position))
+            {
+                if self.editors[index].dirty() {
+                    self.status = Some("Unsaved changes · Ctrl+S save / Ctrl+Q discard".into());
+                } else {
+                    self.close_editor_at(index);
+                    self.status = None;
+                }
+            } else {
+                self.active_editor = Some(index);
+                self.sidebar_focused = false;
+                self.status = None;
+            }
+            return;
+        }
+        if self.active_editor.is_some() {
+            if self.editor_body.contains(position) {
+                self.sidebar_focused = false;
+                let editor_body = self.editor_body;
+                if let Some(editor) = self.active_editor_mut() {
+                    editor.on_mouse(mouse, editor_body);
+                }
+                return;
+            }
+            self.dispatch_sidebar_mouse(mouse);
             return;
         }
         if let Some(preview) = &mut self.preview {
@@ -645,16 +1621,12 @@ impl App {
             }
             return;
         }
-        if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            for (index, button) in self.activity_buttons.iter().enumerate() {
-                if button.contains(Position::new(mouse.column, mouse.row)) {
-                    self.switch_view(
-                        [View::Explorer, View::Search, View::SourceControl][index],
-                        false,
-                    );
-                    return;
-                }
-            }
+        self.dispatch_sidebar_mouse(mouse);
+    }
+
+    fn dispatch_sidebar_mouse(&mut self, mouse: MouseEvent) {
+        if self.active_editor.is_some() {
+            self.sidebar_focused = true;
         }
         match self.view {
             View::Search => {
@@ -671,6 +1643,44 @@ impl App {
 
     fn on_explorer_mouse(&mut self, mouse: MouseEvent) {
         let position = Position::new(mouse.column, mouse.row);
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            && self.body.contains(position)
+        {
+            let index = self.body_index(mouse.row);
+            if let Some(row) = self.tree.rows().get(index) {
+                self.explorer_selected = index;
+                self.open_context_menu(
+                    row.path.clone(),
+                    row.is_dir,
+                    Position::new(mouse.column, mouse.row),
+                );
+            }
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if let Some(source) = self.drag_source.take()
+                && self.body.contains(position)
+            {
+                let index = self.body_index(mouse.row);
+                if let Some(target) = self.tree.rows().get(index).filter(|row| row.is_dir) {
+                    self.move_path_into(&source, &target.path);
+                }
+            }
+            self.drag_target = None;
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            if self.drag_source.is_some() && self.body.contains(position) {
+                let index = self.body_index(mouse.row);
+                self.drag_target = self
+                    .tree
+                    .rows()
+                    .get(index)
+                    .filter(|row| row.is_dir)
+                    .map(|row| row.path.clone());
+            }
+            return;
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             if self.header_actions[0].contains(position) {
                 self.tree.refresh();
@@ -699,6 +1709,8 @@ impl App {
                 .saturating_add(2);
             if row.is_dir && mouse.column < disclosure_end {
                 self.tree.toggle(&row.path);
+            } else {
+                self.drag_source = Some(row.path.clone());
             }
         } else if matches!(
             mouse.kind,
@@ -732,26 +1744,36 @@ impl App {
         let [activity, remaining] =
             Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(content);
         self.draw_activity(frame, activity);
-        if self.preview.is_none() && self.editor.is_none() && self.view == View::SourceControl {
+        if self.preview.is_none()
+            && self.active_editor.is_none()
+            && self.view == View::SourceControl
+        {
             self.scm
                 .draw(frame, remaining, self.icon_theme, self.mouse_pos);
+            self.draw_overlays(frame, area);
             return;
         }
         let [panel, footer] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(remaining);
-        if self.editor.is_some() {
-            self.draw_editor(frame, panel);
+        if self.active_editor.is_some() {
+            let [sidebar, editor_area] =
+                Layout::horizontal([Constraint::Percentage(32), Constraint::Min(0)]).areas(panel);
+            match self.view {
+                View::Explorer => self.draw_explorer_panel(frame, sidebar),
+                View::Search => self
+                    .search
+                    .draw(frame, sidebar, self.icon_theme, self.mouse_pos),
+                View::SourceControl => {
+                    self.scm
+                        .draw(frame, sidebar, self.icon_theme, self.mouse_pos)
+                }
+            }
+            self.draw_editor(frame, editor_area);
         } else if self.preview.is_some() {
             self.draw_preview(frame, panel);
         } else {
             match self.view {
-                View::Explorer => {
-                    let [header, body] =
-                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(panel);
-                    self.draw_explorer_header(frame, header);
-                    self.body = body;
-                    self.draw_explorer(frame, body);
-                }
+                View::Explorer => self.draw_explorer_panel(frame, panel),
                 View::Search => self
                     .search
                     .draw(frame, panel, self.icon_theme, self.mouse_pos),
@@ -762,15 +1784,106 @@ impl App {
             Paragraph::new(self.footer()).style(Style::default().fg(MUTED).bg(BG)),
             footer,
         );
+        self.draw_overlays(frame, area);
+    }
+
+    fn draw_overlays(&mut self, frame: &mut Frame, area: Rect) {
+        if let Some(menu) = &mut self.context_menu {
+            let labels = menu
+                .actions
+                .iter()
+                .map(|action| match action {
+                    ExplorerAction::Open if menu.is_dir => "Open / Collapse",
+                    ExplorerAction::Open => "Open",
+                    ExplorerAction::NewFile => "New File",
+                    ExplorerAction::NewFolder => "New Folder",
+                    ExplorerAction::Rename => "Rename",
+                    ExplorerAction::Delete => "Delete",
+                })
+                .collect::<Vec<_>>();
+            let width = labels
+                .iter()
+                .map(|label| Span::raw(*label).width())
+                .max()
+                .unwrap_or(8)
+                .saturating_add(4)
+                .min(usize::from(area.width)) as u16;
+            let height = (labels.len() as u16 + 2).min(area.height);
+            let popup = Rect::new(
+                menu.origin.x.min(area.right().saturating_sub(width)),
+                menu.origin.y.min(area.bottom().saturating_sub(height)),
+                width,
+                height,
+            );
+            let block = Block::bordered()
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(BG));
+            let items_area = block.inner(popup);
+            let items = labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    ListItem::new(*label).style(if index == menu.selected {
+                        Style::default().fg(FG).bg(SELECTED)
+                    } else {
+                        Style::default().fg(FG).bg(BG)
+                    })
+                })
+                .collect::<Vec<_>>();
+            menu.area = popup;
+            menu.items_area = items_area;
+            frame.render_widget(Clear, popup);
+            frame.render_widget(block, popup);
+            frame.render_widget(List::new(items).style(Style::default().bg(BG)), items_area);
+        }
+        if let Some(dialog) = &self.dialog {
+            let (title, content) = match dialog {
+                Dialog::Input {
+                    title,
+                    value,
+                    cursor,
+                    ..
+                } => {
+                    let left = value[..*cursor].iter().collect::<String>();
+                    let right = value[*cursor..].iter().collect::<String>();
+                    (
+                        title.as_str(),
+                        format!("{left}│{right}\nEnter confirm · Esc cancel"),
+                    )
+                }
+                Dialog::Confirm { message, .. } => (
+                    "Confirm",
+                    format!("{message}\nEnter / y confirm · Esc / n cancel"),
+                ),
+            };
+            let width = (Span::raw(content.lines().next().unwrap_or_default()).width() as u16 + 4)
+                .max(24)
+                .min(area.width);
+            let height = 5.min(area.height);
+            let popup = Rect::new(
+                area.x + area.width.saturating_sub(width) / 2,
+                area.y + area.height.saturating_sub(height) / 2,
+                width,
+                height,
+            );
+            let block = Block::bordered()
+                .title(title)
+                .border_style(Style::default().fg(ACCENT))
+                .style(Style::default().bg(BG));
+            let inner = block.inner(popup);
+            frame.render_widget(Clear, popup);
+            frame.render_widget(block, popup);
+            frame.render_widget(Paragraph::new(content), inner);
+        }
     }
 
     fn draw_activity(&mut self, frame: &mut Frame, area: Rect) {
-        let widths = [Constraint::Length(5); 3];
-        let slots = Layout::horizontal(widths).split(area);
+        let slots = Layout::horizontal([Constraint::Length(16); 3]).split(area);
         let glyphs = match self.icon_theme {
             icons::IconTheme::Material => ["\u{f07b}", "\u{f002}", "\u{f126}"],
             icons::IconTheme::Emoji => ["📁", "🔍", "🔀"],
         };
+        let labels = ["Explorer", "Search", "Source Control"];
         for (index, slot) in slots.iter().enumerate() {
             self.activity_buttons[index] = Rect::new(slot.x, area.y, slot.width, area.height);
             let active = self.view.index() == index;
@@ -785,9 +1898,12 @@ impl App {
             frame.render_widget(Block::default().style(style), *slot);
             let middle = Rect::new(slot.x, slot.y + slot.height / 2, slot.width, 1);
             frame.render_widget(
-                Paragraph::new(glyphs[index])
-                    .alignment(ratatui::layout::Alignment::Center)
-                    .style(style),
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!("{} ", glyphs[index])),
+                    Span::raw(labels[index]),
+                ]))
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(style),
                 middle,
             );
         }
@@ -826,6 +1942,14 @@ impl App {
         );
     }
 
+    fn draw_explorer_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let [header, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        self.draw_explorer_header(frame, header);
+        self.body = body;
+        self.draw_explorer(frame, body);
+    }
+
     fn draw_explorer(&mut self, frame: &mut Frame, body: Rect) {
         let rows = self.tree.rows();
         self.explorer_selected = self.explorer_selected.min(rows.len().saturating_sub(1));
@@ -836,12 +1960,21 @@ impl App {
             height,
             rows.len(),
         );
+        let decorations = self.scm.decorations(&self.tree.root_path());
         let items = rows
             .iter()
             .enumerate()
             .skip(self.explorer_scroll)
             .take(height)
-            .map(|(index, row)| row_item(row, self.icon_theme, index == self.explorer_selected))
+            .map(|(index, row)| {
+                row_item(
+                    row,
+                    self.icon_theme,
+                    index == self.explorer_selected,
+                    self.drag_target.as_deref() == Some(row.path.as_path()),
+                    decorations.get(&row.path).copied(),
+                )
+            })
             .collect::<Vec<_>>();
         frame.render_widget(List::new(items).style(Style::default().bg(BG)), body);
     }
@@ -852,8 +1985,18 @@ impl App {
         };
         let [header, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let title = if preview.hunk_ranges.is_empty() {
+            preview.title.clone()
+        } else {
+            format!(
+                "{} · Hunk {}/{}",
+                preview.title,
+                preview.selected_hunk + 1,
+                preview.hunk_ranges.len(),
+            )
+        };
         frame.render_widget(
-            Paragraph::new(terminal_safe(&preview.title))
+            Paragraph::new(terminal_safe(&title))
                 .style(Style::default().fg(FG).bg(BG).add_modifier(Modifier::BOLD)),
             header,
         );
@@ -878,7 +2021,11 @@ impl App {
                     ));
                 }
                 spans.push(Span::styled(terminal_safe(text), preview_line_style(text)));
-                let row_bg = if preview.line_numbers && index == preview.anchor {
+                let selected_hunk = preview
+                    .hunk_ranges
+                    .get(preview.selected_hunk)
+                    .is_some_and(|(start, end)| (*start..*end).contains(&index));
+                let row_bg = if selected_hunk || (preview.line_numbers && index == preview.anchor) {
                     SELECTED
                 } else {
                     BG
@@ -893,19 +2040,49 @@ impl App {
     }
 
     fn draw_editor(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(editor) = &mut self.editor else {
+        self.editor_tab_buttons.clear();
+        self.editor_tab_close_buttons = vec![Rect::default(); self.editors.len()];
+        let [tabs, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let mut x = tabs.x;
+        for (index, editor) in self.editors.iter().enumerate() {
+            if x >= tabs.right() {
+                break;
+            }
+            let name = editor
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file");
+            let label = format!(" {}{} × ", name, if editor.dirty() { " •" } else { "" });
+            let width = (Span::raw(&label).width() as u16).min(tabs.right() - x);
+            let tab = Rect::new(x, tabs.y, width, 1);
+            self.editor_tab_buttons.push((tab, index));
+            let close = Rect::new(tab.right().saturating_sub(2), tab.y, 2.min(tab.width), 1);
+            self.editor_tab_close_buttons[index] = close;
+            let active = self.active_editor == Some(index);
+            frame.render_widget(
+                Paragraph::new(terminal_safe(&label)).style(if active {
+                    Style::default()
+                        .fg(FG)
+                        .bg(SELECTED)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED).bg(BG)
+                }),
+                tab,
+            );
+            x = tab.right();
+        }
+        let Some(index) = self.active_editor else {
+            self.editor_body = body;
             return;
         };
-        let [header, body] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let Some(editor) = self.editors.get_mut(index) else {
+            return;
+        };
         editor.ensure_visible(usize::from(body.width), usize::from(body.height));
         self.editor_body = body;
-        let marker = if editor.dirty() { " *" } else { "" };
-        frame.render_widget(
-            Paragraph::new(format!(" {}{marker}", editor.path().display()))
-                .style(Style::default().fg(FG).bg(BG).add_modifier(Modifier::BOLD)),
-            header,
-        );
         let rows = editor
             .lines()
             .iter()
@@ -914,6 +2091,16 @@ impl App {
             .take(usize::from(body.height))
             .map(|(index, line)| {
                 let current = index == editor.cursor_line();
+                let selection = editor.selection().and_then(|(start, end)| {
+                    (index >= start.line && index <= end.line).then_some((
+                        if index == start.line { start.col } else { 0 },
+                        if index == end.line {
+                            end.col
+                        } else {
+                            line.len()
+                        },
+                    ))
+                });
                 let mut spans = vec![Span::styled(
                     format!("{:>5} ", index + 1),
                     Style::default().fg(if current { ACCENT } else { MUTED }),
@@ -921,6 +2108,7 @@ impl App {
                 spans.extend(editor_line_spans(
                     line,
                     current.then_some(editor.cursor_col()),
+                    selection,
                     editor.horizontal_scroll(),
                 ));
                 ListItem::new(Line::from(spans))
@@ -930,16 +2118,51 @@ impl App {
     }
 
     fn footer(&self) -> String {
-        if self.editor.is_some() {
-            if let Some(status) = &self.status {
-                return terminal_safe(status);
-            }
-            return "Type · Ctrl+S save · Esc back · Ctrl+Q discard · Ctrl+R reload".into();
+        if let Some(editor) = self.active_editor() {
+            let language = language_for_path(editor.path());
+            let encoding = if editor.has_bom() {
+                "UTF-8 BOM"
+            } else {
+                "UTF-8"
+            };
+            let details = format!(
+                "{language} · Ln {}/{}, Col {} · {encoding} · {}",
+                editor.cursor_line() + 1,
+                editor.line_count(),
+                editor.cursor_col() + 1,
+                editor.line_ending(),
+            );
+            return if let Some(status) = &self.status {
+                format!(
+                    "{} · {details} · Ctrl+S save · Ctrl+Z undo · Ctrl+Q discard",
+                    terminal_safe(status)
+                )
+            } else {
+                format!("{details} · Ctrl+S save · Ctrl+Z undo · Ctrl+Y redo · Ctrl+W close tab")
+            };
         }
         if let Some(status) = &self.status {
             return terminal_safe(status);
         }
         if let Some(preview) = &self.preview {
+            if !preview.hunk_ranges.is_empty() {
+                return if preview
+                    .git_target
+                    .as_ref()
+                    .is_some_and(|target| target.staged)
+                {
+                    "[ ] hunk · u unstage hunk · d discard file · Esc back".into()
+                } else {
+                    "[ ] hunk · s stage hunk · d discard file · Esc back".into()
+                };
+            }
+            if preview.git_target.is_some() {
+                return if preview.edit_target.is_some() {
+                    "e edit · d discard · Esc back".into()
+                } else {
+                    "d discard · Esc back".into()
+                };
+            }
             return if preview.edit_target.is_some() {
                 "↑↓ scroll · e edit file · Esc back".into()
             } else {
@@ -947,7 +2170,7 @@ impl App {
             };
         }
         match self.view {
-            View::Explorer => "↑↓ move  click select/arrow  Enter expand  . hidden  r refresh  c collapse  2 Search  3 Source Control  q quit".into(),
+            View::Explorer => "↑↓ move  Enter open/expand  n new file  m menu  . hidden  r refresh  c collapse  2 Search  3 Source Control  q quit".into(),
             View::Search => "type search  Tab fields/results  ↑↓ select  Enter open  Ctrl+F focus  Esc back".into(),
             View::SourceControl => "↑↓ move  Enter expand/stage  a stage all  u unstage all  r refresh  2 Search  q quit".into(),
         }
@@ -957,6 +2180,7 @@ impl App {
 fn editor_line_spans(
     line: &[char],
     cursor_col: Option<usize>,
+    selection: Option<(usize, usize)>,
     horizontal_scroll: usize,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -977,8 +2201,11 @@ fn editor_line_spans(
         } else {
             terminal_safe(&ch.to_string())
         };
+        let selected = selection.is_some_and(|(start, end)| index >= start && index < end);
         let style = if cursor_col == Some(index) {
             Style::default().fg(BG).bg(ACCENT)
+        } else if selected {
+            Style::default().fg(FG).bg(SELECTED)
         } else {
             Style::default().fg(FG)
         };
@@ -992,6 +2219,64 @@ fn editor_line_spans(
         spans.push(Span::raw(""));
     }
     spans
+}
+
+fn language_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "Rust",
+        "md" | "markdown" => "Markdown",
+        "toml" => "TOML",
+        "json" => "JSON",
+        "py" => "Python",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "go" => "Go",
+        "c" | "h" => "C",
+        "cc" | "cpp" | "cxx" | "hpp" => "C++",
+        "sh" | "bash" => "Shell",
+        "yml" | "yaml" => "YAML",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "sql" => "SQL",
+        "java" => "Java",
+        _ => "Plain Text",
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let encoded = base64(text.as_bytes());
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = *chunk.get(1).unwrap_or(&0);
+        let third = *chunk.get(2).unwrap_or(&0);
+        result.push(TABLE[(first >> 2) as usize] as char);
+        result.push(TABLE[(((first & 0b11) << 4) | (second >> 4)) as usize] as char);
+        result.push(if chunk.len() > 1 {
+            TABLE[(((second & 0b1111) << 2) | (third >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if chunk.len() > 2 {
+            TABLE[(third & 0b11_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    result
 }
 
 fn preview_line_style(line: &str) -> Style {
@@ -1030,27 +2315,33 @@ fn read_preview_file(path: &Path) -> (String, bool) {
 }
 
 // ponytail: one-file Git previews are capped at 1 MiB for display; stream Git output if large diffs become common.
+fn split_diff_hunks(lines: &[String]) -> Vec<String> {
+    let mut headers = Vec::new();
+    let mut current = Vec::new();
+    let mut hunks = Vec::new();
+    for line in lines {
+        if line.starts_with("@@") {
+            if !current.is_empty() {
+                hunks.push(format!("{}\n", current.join("\n")));
+            }
+            current = headers.clone();
+            current.push(line.clone());
+        } else if current.is_empty() {
+            headers.push(line.clone());
+        } else {
+            current.push(line.clone());
+        }
+    }
+    if !current.is_empty() {
+        hunks.push(format!("{}\n", current.join("\n")));
+    }
+    hunks
+}
+
 fn git_diff(root: &Path, relative: &Path, staged: bool) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command.current_dir(root).args([
-        "-c",
-        "color.ui=false",
-        "diff",
-        "--no-ext-diff",
-        "--unified=3",
-    ]);
-    if staged {
-        command.arg("--cached");
-    }
-    let output = command
-        .arg("--")
-        .arg(relative)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    Ok(bounded_text(&output.stdout))
+    let relative = relative.to_string_lossy();
+    let diff = Git::discover(root)?.diff(&relative, staged)?;
+    Ok(bounded_text(diff.as_bytes()))
 }
 
 fn git_reference_preview(root: &Path, reference: &str) -> (String, String) {
@@ -1137,7 +2428,13 @@ fn keep_visible(selected: usize, scroll: &mut usize, height: usize, len: usize) 
     }
 }
 
-fn row_item(row: &Row, theme: icons::IconTheme, selected: bool) -> ListItem<'static> {
+fn row_item(
+    row: &Row,
+    theme: icons::IconTheme,
+    selected: bool,
+    drop_target: bool,
+    decoration: Option<char>,
+) -> ListItem<'static> {
     let disclosure = if row.is_dir {
         if row.expanded { "▾ " } else { "▸ " }
     } else {
@@ -1158,12 +2455,34 @@ fn row_item(row: &Row, theme: icons::IconTheme, selected: bool) -> ListItem<'sta
             },
         ),
     ];
-    if selected {
+    if let Some(decoration) = decoration {
+        spans.push(Span::styled(
+            format!(" {decoration}"),
+            Style::default()
+                .fg(git_color(decoration))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if selected || drop_target {
         for span in &mut spans {
-            *span = span.clone().style(span.style.bg(SELECTED));
+            *span = span.clone().style(span.style.bg(if selected {
+                SELECTED
+            } else {
+                Color::Rgb(0x2a, 0x3d, 0x36)
+            }));
         }
     }
     ListItem::new(Line::from(spans))
+}
+
+fn git_color(status: char) -> Color {
+    match status {
+        'A' | 'U' => Color::Rgb(0x8b, 0xd4, 0x9c),
+        'D' | '!' => Color::Rgb(0xe4, 0x67, 0x6b),
+        'R' | 'C' => Color::Rgb(0x82, 0xaa, 0xff),
+        '•' => MUTED,
+        _ => Color::Rgb(0xe5, 0xc0, 0x7b),
+    }
 }
 
 fn icon_span(icon: icons::Icon) -> Span<'static> {
@@ -1210,7 +2529,7 @@ mod tests {
         let mut app = App::new(root.clone(), None);
         let original_view = app.view;
         app.on_explorer_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.editor.is_some());
+        assert!(app.active_editor.is_some());
         assert!(app.preview.is_none());
         assert!(app.view == original_view);
 
@@ -1231,13 +2550,16 @@ mod tests {
             "view/quit keys must not escape a dirty editor"
         );
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.editor.is_some(), "Esc must not discard unsaved text");
+        assert!(
+            app.active_editor.is_some(),
+            "Esc must not discard unsaved text"
+        );
         app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert!(app.editor.is_none());
+        assert!(app.active_editor.is_none());
 
         app.switch_view(View::Search, true);
         app.on_search_action(SearchAction::OpenHit("file.txt".into(), 1));
-        assert!(app.editor.is_some());
+        assert!(app.active_editor.is_some());
         assert!(app.view == View::Search);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1277,8 +2599,22 @@ mod tests {
                 .join("\n")
                 .contains("+after")
         );
+        assert_eq!(app.preview.as_ref().unwrap().hunks.len(), 1);
+        app.on_preview_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let status = Git::discover(&root).unwrap().status().unwrap();
+        assert_eq!(status.staged.len(), 1);
+        assert!(status.unstaged.is_empty());
+        app.on_scm_action(ScmAction::OpenFile {
+            root: root.clone(),
+            path: "change.txt".into(),
+            staged: true,
+        });
+        app.on_preview_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        let status = Git::discover(&root).unwrap().status().unwrap();
+        assert!(status.staged.is_empty(), "{status:?}");
+        assert_eq!(status.unstaged.len(), 1);
         app.on_preview_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        assert!(app.editor.is_none(), "diff previews stay read-only");
+        assert!(app.active_editor.is_none(), "diff previews stay read-only");
         assert_eq!(
             std::fs::read_to_string(root.join("change.txt")).unwrap(),
             "after\n"
@@ -1286,7 +2622,10 @@ mod tests {
 
         app.open_reference_preview(&root, DrawerRef::Commit("HEAD".into()));
         app.on_preview_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
-        assert!(app.editor.is_none(), "commit previews stay read-only");
+        assert!(
+            app.active_editor.is_none(),
+            "commit previews stay read-only"
+        );
         let (title, text) = git_reference_preview(&root, "HEAD");
         assert!(title.contains("HEAD"));
         assert!(text.contains("preview commit"));
@@ -1306,6 +2645,250 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.preview.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn multiple_editors_preserve_buffers_and_close_tabs_safely() {
+        let root = temp_dir("tabs");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.rs");
+        let second = root.join("second.md");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let mut app = App::new(root.clone(), None);
+
+        app.open_editor(&first, 0);
+        app.on_editor_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.on_editor_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        app.open_editor(&second, 0);
+        assert_eq!(app.editors.len(), 2);
+        assert_eq!(app.active_editor, Some(1));
+        app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL));
+        assert!(app.view == View::Explorer);
+        assert_eq!(app.active_editor, Some(1));
+
+        app.open_editor(&first, 0);
+        assert_eq!(app.active_editor, Some(0));
+        assert_eq!(
+            app.active_editor().unwrap().lines()[0]
+                .iter()
+                .collect::<String>(),
+            "first!"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(
+            app.active_editor,
+            Some(0),
+            "dirty tabs cannot be closed accidentally"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(app.editors.len(), 1);
+        assert_eq!(app.active_editor, Some(0));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(app.editors.is_empty());
+        assert!(app.active_editor.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explorer_context_menu_opens_a_name_prompt_and_creates_folder() {
+        let root = temp_dir("context-menu");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut app = App::new(root.clone(), None);
+        app.open_context_menu(file, false, Position::new(10, 5));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for ch in "created".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(root.join("created").is_dir());
+        assert!(app.dialog.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_encoding_and_language_status_are_stable() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(language_for_path(Path::new("main.rs")), "Rust");
+        assert_eq!(language_for_path(Path::new("README.md")), "Markdown");
+        assert_eq!(language_for_path(Path::new("data.unknown")), "Plain Text");
+    }
+
+    #[test]
+    fn explorer_file_operations_are_confined_and_keep_open_tabs_in_sync() {
+        let root = temp_dir("file-ops");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(root.clone(), None);
+
+        assert!(app.create_file(&root, "../outside").is_err());
+        let file = app.create_file(&root, "before.txt").unwrap().unwrap();
+        assert!(file.is_file());
+        assert!(app.create_file(&root, "before.txt").is_err());
+        app.open_editor(&file, 0);
+
+        let renamed = app.rename_path(&file, "after.txt").unwrap().unwrap();
+        assert_eq!(app.active_editor().unwrap().path(), renamed);
+        let folder = app.create_folder(&root, "target").unwrap().unwrap();
+        app.move_path_into(&renamed, &folder);
+        let moved = folder.join("after.txt");
+        assert!(moved.is_file());
+        assert_eq!(app.active_editor().unwrap().path(), moved);
+
+        app.execute_confirm(ConfirmAction::DeletePath(folder.clone()));
+        assert!(!folder.exists());
+        assert!(app.editors.is_empty());
+        assert!(app.active_editor.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dirty_editor_blocks_git_worktree_switches() {
+        let root = temp_dir("dirty-git-switch");
+        let git_cmd = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git_cmd(&["init", "-q", "-b", "main"]);
+        git_cmd(&["config", "user.name", "teditor test"]);
+        git_cmd(&["config", "user.email", "teditor@example.invalid"]);
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        git_cmd(&["add", "file.txt"]);
+        git_cmd(&["commit", "-qm", "base"]);
+        git_cmd(&["branch", "topic"]);
+
+        let mut app = App::new(root.clone(), None);
+        app.open_editor(&root.join("file.txt"), 0);
+        app.active_editor_mut().unwrap().paste("unsaved");
+        app.on_scm_action(ScmAction::SwitchBranch {
+            root: root.clone(),
+            name: "topic".into(),
+        });
+        assert!(app.active_editor().unwrap().dirty());
+        assert_eq!(
+            Git::discover(&root).unwrap().status().unwrap().branch,
+            "main"
+        );
+        assert!(app.status.as_deref().unwrap().contains("Save or discard"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_editor_tabs_reload_after_git_switches() {
+        let root = temp_dir("clean-git-switch");
+        let git_cmd = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git_cmd(&["init", "-q", "-b", "main"]);
+        git_cmd(&["config", "user.name", "teditor test"]);
+        git_cmd(&["config", "user.email", "teditor@example.invalid"]);
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        git_cmd(&["add", "file.txt"]);
+        git_cmd(&["commit", "-qm", "base"]);
+        git_cmd(&["switch", "-qc", "topic"]);
+        std::fs::write(root.join("file.txt"), "topic\n").unwrap();
+        git_cmd(&["commit", "-qam", "topic update"]);
+        git_cmd(&["switch", "-q", "main"]);
+
+        let mut app = App::new(root.clone(), None);
+        app.open_editor(&root.join("file.txt"), 0);
+        app.on_scm_action(ScmAction::SwitchBranch {
+            root: root.clone(),
+            name: "topic".into(),
+        });
+        let text = app.active_editor().unwrap().lines()[0]
+            .iter()
+            .collect::<String>();
+        assert_eq!(text, "topic");
+        assert_eq!(
+            Git::discover(&root).unwrap().status().unwrap().branch,
+            "topic"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preview_hunk_actions_stage_only_the_selected_change() {
+        let root = temp_dir("partial-stage");
+        let git_cmd = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git_cmd(&["init", "-q", "-b", "main"]);
+        git_cmd(&["config", "user.name", "teditor test"]);
+        git_cmd(&["config", "user.email", "teditor@example.invalid"]);
+        let base = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>();
+        std::fs::write(root.join("file.txt"), format!("{}\n", base.join("\n"))).unwrap();
+        git_cmd(&["add", "file.txt"]);
+        git_cmd(&["commit", "-qm", "base"]);
+        let mut changed = base;
+        changed[1] = "changed two".into();
+        changed[17] = "changed eighteen".into();
+        std::fs::write(root.join("file.txt"), format!("{}\n", changed.join("\n"))).unwrap();
+
+        let git = Git::discover(&root).unwrap();
+        let diff = git.diff("file.txt", false).unwrap();
+        let lines = diff.lines().map(str::to_owned).collect::<Vec<_>>();
+        let hunks = split_diff_hunks(&lines);
+        assert_eq!(hunks.len(), 2);
+        git.apply_hunk(&hunks[0], false).unwrap();
+        let staged = git.diff("file.txt", true).unwrap();
+        let unstaged = git.diff("file.txt", false).unwrap();
+        assert!(staged.contains("+changed two"));
+        assert!(!staged.contains("+changed eighteen"));
+        assert!(unstaged.contains("+changed eighteen"));
+        assert!(!unstaged.contains("+changed two"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_diff_hunks_keep_file_headers_and_separate_changes() {
+        let diff = [
+            "diff --git a/file.txt b/file.txt",
+            "index 1111111..2222222 100644",
+            "--- a/file.txt",
+            "+++ b/file.txt",
+            "@@ -1 +1 @@",
+            "-before one",
+            "+after one",
+            "@@ -9 +9 @@",
+            "-before two",
+            "+after two",
+        ]
+        .map(str::to_owned);
+        let hunks = split_diff_hunks(&diff);
+        assert_eq!(hunks.len(), 2);
+        assert!(hunks[0].starts_with("diff --git a/file.txt b/file.txt\n"));
+        assert!(hunks[1].starts_with("diff --git a/file.txt b/file.txt\n"));
+        assert!(hunks[0].contains("+after one"));
+        assert!(!hunks[0].contains("+after two"));
+        assert!(hunks[1].contains("+after two"));
+        assert!(!hunks[1].contains("+after one"));
     }
 
     #[test]

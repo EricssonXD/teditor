@@ -3,8 +3,9 @@
 //! Commands run at the repository root, so porcelain's repo-relative paths
 //! work even when discovery starts in a subdirectory. No UI or IPC is needed.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// The reference sidebar shows at most 30 commits in history drawers.
 /// Other drawers list all entries; graph connector lines are not truncated.
@@ -184,6 +185,157 @@ impl Git {
         Ok(out.lines().next().unwrap_or("committed").to_string())
     }
 
+    pub fn diff(&self, path: &str, staged: bool) -> Result<String, String> {
+        self.safe_repo_path(path)?;
+        let mut args = vec!["diff", "--no-ext-diff", "--unified=3"];
+        if staged {
+            args.push("--cached");
+        }
+        args.extend(["--", path]);
+        run_in(&self.root, &args)
+    }
+
+    pub fn apply_hunk(&self, patch: &str, reverse: bool) -> Result<(), String> {
+        let mut args = vec!["apply", "--cached"];
+        if reverse {
+            args.push("--reverse");
+        }
+        run_with_input(&self.root, &args, patch).map(drop)
+    }
+
+    pub fn discard_path(&self, path: &str, staged: bool) -> Result<(), String> {
+        self.safe_repo_path(path)?;
+        let status = self.status()?;
+        let entries = if staged {
+            &status.staged
+        } else {
+            &status.unstaged
+        };
+        let entry = entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .ok_or_else(|| "File is no longer changed".to_string())?;
+        let mut paths = vec![entry.path.as_str()];
+        if let Some(original) = entry.orig.as_deref() {
+            paths.push(original);
+            self.safe_repo_path(original)?;
+        }
+        if !staged && entry.letter == 'U' {
+            let file = self.safe_repo_path(path)?;
+            return std::fs::remove_file(file)
+                .map_err(|error| format!("Cannot delete untracked file: {error}"));
+        }
+        if staged && !self.has_head() {
+            let mut args = vec!["rm", "-f", "--"];
+            args.extend(paths);
+            return run_in(&self.root, &args).map(drop);
+        }
+        if staged {
+            let mut args = vec!["restore", "--source=HEAD", "--staged", "--worktree", "--"];
+            args.extend(paths);
+            run_in(&self.root, &args).map(drop)
+        } else {
+            let mut args = vec!["restore", "--worktree", "--"];
+            args.extend(paths);
+            run_in(&self.root, &args).map(drop)
+        }
+    }
+
+    pub fn create_branch(&self, name: &str) -> Result<(), String> {
+        self.validate_branch(name)?;
+        run_in(&self.root, &["switch", "-c", name]).map(drop)
+    }
+
+    pub fn switch_branch(&self, name: &str) -> Result<(), String> {
+        self.validate_branch(name)?;
+        if run_in(&self.root, &["switch", "--track", name]).is_ok() {
+            return Ok(());
+        }
+        run_in(&self.root, &["switch", name]).map(drop)
+    }
+
+    pub fn delete_branch(&self, name: &str) -> Result<(), String> {
+        self.validate_branch(name)?;
+        run_in(&self.root, &["branch", "-d", "--", name]).map(drop)
+    }
+
+    pub fn checkout_tag(&self, name: &str) -> Result<(), String> {
+        let reference = format!("refs/tags/{name}");
+        self.validate_ref(&reference)?;
+        run_in(&self.root, &["switch", "--detach", name]).map(drop)
+    }
+
+    pub fn checkout_commit(&self, hash: &str) -> Result<(), String> {
+        if hash.len() < 4 || hash.len() > 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Invalid commit id".into());
+        }
+        let expression = format!("{hash}^{{commit}}");
+        let resolved = run_in(&self.root, &["rev-parse", "--verify", &expression])?;
+        run_in(&self.root, &["switch", "--detach", resolved.trim()]).map(drop)
+    }
+
+    pub fn fetch(&self) -> Result<String, String> {
+        run_in(&self.root, &["fetch", "--all"])
+    }
+
+    pub fn pull(&self) -> Result<String, String> {
+        run_in(&self.root, &["pull", "--ff-only"])
+    }
+
+    pub fn push(&self) -> Result<String, String> {
+        if self.status()?.has_upstream {
+            run_in(&self.root, &["push"])
+        } else {
+            run_in(&self.root, &["push", "--set-upstream", "origin", "HEAD"])
+        }
+    }
+
+    pub fn stash_push(&self, message: &str) -> Result<String, String> {
+        if message.trim().is_empty() {
+            return Err("Stash message cannot be empty".into());
+        }
+        run_in(
+            &self.root,
+            &["stash", "push", "--include-untracked", "-m", message],
+        )
+    }
+
+    pub fn stash_apply(&self, index: usize) -> Result<String, String> {
+        let reference = format!("stash@{{{index}}}");
+        run_in(&self.root, &["stash", "apply", &reference])
+    }
+
+    pub fn stash_drop(&self, index: usize) -> Result<String, String> {
+        let reference = format!("stash@{{{index}}}");
+        run_in(&self.root, &["stash", "drop", &reference])
+    }
+
+    fn validate_branch(&self, name: &str) -> Result<(), String> {
+        if name.starts_with('-') || name.trim() != name || name.is_empty() {
+            return Err("Invalid branch name".into());
+        }
+        run_in(&self.root, &["check-ref-format", "--branch", name]).map(drop)
+    }
+
+    fn validate_ref(&self, name: &str) -> Result<(), String> {
+        if name.starts_with('-') || name.trim() != name || name.is_empty() {
+            return Err("Invalid Git reference".into());
+        }
+        run_in(&self.root, &["check-ref-format", name]).map(drop)
+    }
+
+    fn safe_repo_path(&self, path: &str) -> Result<PathBuf, String> {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| component == Component::ParentDir)
+        {
+            return Err("Git path must stay inside the repository".into());
+        }
+        Ok(self.root.join(relative))
+    }
+
     /// History reachable from HEAD only, exactly like the reference graph.
     /// `limit` limits commits, NOT output lines (connectors are preserved).
     pub fn graph(&self, limit: usize) -> Result<Vec<String>, String> {
@@ -287,6 +439,34 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
 
 fn run_in(dir: &Path, args: &[&str]) -> Result<String, String> {
     command_output(git_command(dir, args))
+}
+
+fn run_with_input(dir: &Path, args: &[&str], input: &str) -> Result<String, String> {
+    let mut child = git_command(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("git: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git stdin unavailable".to_string())?
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("git stdin: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("git: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("git failed")
+            .trim()
+            .to_string())
+    }
 }
 
 fn command_output(mut command: Command) -> Result<String, String> {
@@ -594,6 +774,153 @@ mod tests {
             all.contains("unmerged-only commit"),
             "fixture must detect --all"
         );
+    }
+
+    #[test]
+    fn tag_and_commit_checkout_detach_and_validate_commit_ids() {
+        let temp = TempDir::new();
+        let git = init(&temp.0);
+        commit_file(&git, "file.txt", "base\n", "base");
+        let head = run_in(git.root(), &["rev-parse", "HEAD"]).unwrap();
+        run_in(git.root(), &["tag", "v1"]).unwrap();
+
+        git.checkout_tag("v1").unwrap();
+        assert!(git.status().unwrap().branch.starts_with("HEAD"));
+        assert_eq!(
+            run_in(git.root(), &["rev-parse", "HEAD"]).unwrap().trim(),
+            head.trim()
+        );
+        git.switch_branch("main").unwrap();
+        git.checkout_commit(head.trim()).unwrap();
+        assert!(git.status().unwrap().branch.starts_with("HEAD"));
+        assert!(git.checkout_commit("not-a-commit").is_err());
+        assert!(git.checkout_commit("deadbeef").is_err());
+    }
+
+    #[test]
+    fn branch_discard_and_hunk_operations_are_safe() {
+        let temp = TempDir::new();
+        let git = init(&temp.0);
+        commit_file(&git, "file.txt", "one\ntwo\nthree\n", "base");
+
+        git.create_branch("topic").unwrap();
+        assert_eq!(git.status().unwrap().branch, "topic");
+        git.switch_branch("main").unwrap();
+        git.delete_branch("topic").unwrap();
+        assert!(git.create_branch("../outside").is_err());
+        assert!(git.switch_branch("--help").is_err());
+
+        fs::write(git.root().join("file.txt"), "ONE\ntwo\nthree\n").unwrap();
+        let patch = git.diff("file.txt", false).unwrap();
+        git.apply_hunk(&patch, false).unwrap();
+        assert_eq!(git.status().unwrap().staged.len(), 1);
+        let staged_patch = git.diff("file.txt", true).unwrap();
+        git.apply_hunk(&staged_patch, true).unwrap();
+        assert!(git.status().unwrap().staged.is_empty());
+        assert!(!git.status().unwrap().unstaged.is_empty());
+        git.discard_path("file.txt", false).unwrap();
+        assert_eq!(
+            fs::read_to_string(git.root().join("file.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+
+        fs::write(git.root().join("file.txt"), "staged\n").unwrap();
+        git.stage(&entry("file.txt", 'M', None)).unwrap();
+        git.discard_path("file.txt", true).unwrap();
+        assert_eq!(
+            fs::read_to_string(git.root().join("file.txt")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+
+        fs::write(git.root().join("loose.txt"), "loose").unwrap();
+        git.discard_path("loose.txt", false).unwrap();
+        assert!(!git.root().join("loose.txt").exists());
+    }
+
+    #[test]
+    fn local_remote_push_fetch_and_fast_forward_pull_work() {
+        let temp = TempDir::new();
+        let remote_path = temp.0.join("origin.git");
+        run_in(
+            &temp.0,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let local_path = temp.0.join("local");
+        let local = init(&local_path);
+        commit_file(&local, "file.txt", "base\n", "base");
+        run_in(
+            local.root(),
+            &["remote", "add", "origin", remote_path.to_str().unwrap()],
+        )
+        .unwrap();
+        local.push().unwrap();
+
+        let peer_path = temp.0.join("peer");
+        run_in(
+            &temp.0,
+            &[
+                "clone",
+                remote_path.to_str().unwrap(),
+                peer_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        run_in(&peer_path, &["config", "user.name", "Peer"]).unwrap();
+        run_in(
+            &peer_path,
+            &["config", "user.email", "peer@example.invalid"],
+        )
+        .unwrap();
+        fs::write(peer_path.join("file.txt"), "peer\n").unwrap();
+        run_in(&peer_path, &["add", "file.txt"]).unwrap();
+        run_in(&peer_path, &["commit", "-qm", "peer update"]).unwrap();
+        run_in(&peer_path, &["push"]).unwrap();
+
+        local.fetch().unwrap();
+        assert_eq!(local.status().unwrap().behind, 1);
+        local.pull().unwrap();
+        assert_eq!(
+            fs::read_to_string(local.root().join("file.txt")).unwrap(),
+            "peer\n"
+        );
+        fs::write(local.root().join("local.txt"), "local\n").unwrap();
+        local.stage(&entry("local.txt", 'A', None)).unwrap();
+        local.commit("local update").unwrap();
+        local.push().unwrap();
+        assert!(run_in(&peer_path, &["pull", "--ff-only"]).is_ok());
+        assert!(peer_path.join("local.txt").exists());
+
+        run_in(&peer_path, &["switch", "-c", "topic"]).unwrap();
+        fs::write(peer_path.join("topic.txt"), "remote branch\n").unwrap();
+        run_in(&peer_path, &["add", "topic.txt"]).unwrap();
+        run_in(&peer_path, &["commit", "-qm", "topic branch"]).unwrap();
+        run_in(&peer_path, &["push", "-u", "origin", "topic"]).unwrap();
+        local.fetch().unwrap();
+        local.switch_branch("origin/topic").unwrap();
+        assert_eq!(local.status().unwrap().branch, "topic");
+    }
+
+    #[test]
+    fn stash_actions_apply_and_drop_the_selected_entry() {
+        let temp = TempDir::new();
+        let git = init(&temp.0);
+        commit_file(&git, "file.txt", "base\n", "base");
+        fs::write(git.root().join("file.txt"), "changed\n").unwrap();
+        git.stash_push("test stash").unwrap();
+        assert_eq!(git.stashes().unwrap().len(), 1);
+        git.stash_apply(0).unwrap();
+        assert_eq!(
+            fs::read_to_string(git.root().join("file.txt")).unwrap(),
+            "changed\n"
+        );
+        git.stash_drop(0).unwrap();
+        assert!(git.stashes().unwrap().is_empty());
     }
 
     #[test]
